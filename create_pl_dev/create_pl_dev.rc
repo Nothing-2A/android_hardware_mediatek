@@ -4,6 +4,9 @@ on post-fs
     wait /dev/block/mapper/preloader_raw_a
     wait /dev/block/mapper/preloader_raw_b
 
+    symlink /dev/block/mapper/preloader_raw_a /dev/block/mapper/pl_a
+    symlink /dev/block/mapper/preloader_raw_b /dev/block/mapper/pl_b
+
     symlink /dev/block/mapper/preloader_raw_a /dev/block/by-name/preloader_raw_a
     symlink /dev/block/mapper/preloader_raw_b /dev/block/by-name/preloader_raw_b
 
