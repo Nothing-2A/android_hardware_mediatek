@@ -130,10 +130,6 @@ int main(int /* argc */, char* /* argv */ []) {
             "android.hardware.bluetooth.audio-impl",
             "createIBluetoothAudioProviderFactory",
         },
-        {
-            "android.hardware.audio.sounddose-vendor-impl",
-            "createISoundDoseFactory",
-        },
     };
     // clang-format on
 
