@@ -97,18 +97,15 @@ int main(int /* argc */, char* /* argv */ []) {
     const std::vector<InterfacesList> mandatoryInterfaces = {
         {
             "Audio Core API",
+#ifndef USES_MTKAUDIO_CORE_V7_1
             "android.hardware.audio@7.1::IDevicesFactory",
+#else
             "android.hardware.audio@7.0::IDevicesFactory",
-            "android.hardware.audio@6.0::IDevicesFactory",
-            "android.hardware.audio@5.0::IDevicesFactory",
-            "android.hardware.audio@4.0::IDevicesFactory",
+#endif
         },
         {
             "Audio Effect API",
             "android.hardware.audio.effect@7.0::IEffectsFactory",
-            "android.hardware.audio.effect@6.0::IEffectsFactory",
-            "android.hardware.audio.effect@5.0::IEffectsFactory",
-            "android.hardware.audio.effect@4.0::IEffectsFactory",
         }
     };
 
@@ -125,11 +122,6 @@ int main(int /* argc */, char* /* argv */ []) {
             "android.hardware.bluetooth.audio@2.2::IBluetoothAudioProvidersFactory",
             "android.hardware.bluetooth.audio@2.1::IBluetoothAudioProvidersFactory",
             "android.hardware.bluetooth.audio@2.0::IBluetoothAudioProvidersFactory",
-        },
-        // remove the old HIDL when Bluetooth Audio Hal V2 has offloading supported
-        {
-            "Bluetooth Audio Offload API",
-            "android.hardware.bluetooth.a2dp@1.0::IBluetoothAudioOffload"
         }
     };
 
