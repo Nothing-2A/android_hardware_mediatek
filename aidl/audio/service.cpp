@@ -120,6 +120,7 @@ int main(int /* argc */, char* /* argv */ []) {
     };
 
     const std::vector<InterfacesList> optionalInterfaces = {
+#ifndef USES_MTKAUDIO_AIDL
         {
             "Soundtrigger API",
             "android.hardware.soundtrigger@2.3::ISoundTriggerHw",
@@ -127,6 +128,7 @@ int main(int /* argc */, char* /* argv */ []) {
             "android.hardware.soundtrigger@2.1::ISoundTriggerHw",
             "android.hardware.soundtrigger@2.0::ISoundTriggerHw",
         },
+#endif
         {
             "Vendor Bluetooth Audio API",
             "vendor.mediatek.hardware.bluetooth.audio@2.2::IBluetoothAudioProvidersFactory",
@@ -135,6 +137,12 @@ int main(int /* argc */, char* /* argv */ []) {
     };
 
     const std::vector<std::pair<std::string,std::string>> optionalInterfaceSharedLibs = {
+#ifdef USES_MTKAUDIO_AIDL
+        {
+            "android.hardware.bluetooth.audio-impl-mediatek",
+            "createIBluetoothAudioProviderFactory",
+        }
+#else
         {
             "vendor.mediatek.hardware.bluetooth.audio-impl",
             "createIBluetoothAudioProviderFactory",
@@ -142,7 +150,8 @@ int main(int /* argc */, char* /* argv */ []) {
         {
             "android.hardware.bluetooth.audio-impl",
             "createIBluetoothAudioProviderFactory",
-        },
+        }
+#endif
     };
     // clang-format on
 

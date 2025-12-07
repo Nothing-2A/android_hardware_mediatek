@@ -11,7 +11,10 @@ cc_binary {
         "-Wall",
         "-Wextra",
         "-Werror",
-    ] + select(soong_config_variable("android_hardware_audio", "uses_mtkaudio_core_v7_1"), {
+    ] + select(soong_config_variable("android_hardware_audio", "uses_mtkaudio_aidl"), {
+        false: [],
+        default: ["-DUSES_MTKAUDIO_AIDL"],
+    }) + select(soong_config_variable("android_hardware_audio", "uses_mtkaudio_core_v7_1"), {
         true: ["-DUSES_MTKAUDIO_CORE_V7_1"],
         default: [],
     }),
