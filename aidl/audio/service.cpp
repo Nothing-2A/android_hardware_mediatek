@@ -47,6 +47,16 @@ static bool registerPassthroughServiceImplementations(Iter first, Iter last) {
     return false;
 }
 
+template <class Iter>
+static bool registerMandatoryPassthroughServiceImplementations(Iter first, Iter last) {
+    bool ret = false;
+    for (; first != last; ++first) {
+        const std::string& interfaceName = *first;
+        ret |= (registerPassthroughServiceImplementation(*first) == OK);
+    }
+    return ret;
+}
+
 static bool registerExternalServiceImplementation(const std::string& libName,
                                                   const std::string& funcName) {
     constexpr int dlMode = RTLD_LAZY;
@@ -118,14 +128,17 @@ int main(int /* argc */, char* /* argv */ []) {
             "android.hardware.soundtrigger@2.0::ISoundTriggerHw",
         },
         {
-            "Bluetooth Audio API",
-            "android.hardware.bluetooth.audio@2.2::IBluetoothAudioProvidersFactory",
-            "android.hardware.bluetooth.audio@2.1::IBluetoothAudioProvidersFactory",
-            "android.hardware.bluetooth.audio@2.0::IBluetoothAudioProvidersFactory",
+            "Vendor Bluetooth Audio API",
+            "vendor.mediatek.hardware.bluetooth.audio@2.2::IBluetoothAudioProvidersFactory",
+            "vendor.mediatek.hardware.bluetooth.audio@2.1::IBluetoothAudioProvidersFactory",
         }
     };
 
     const std::vector<std::pair<std::string,std::string>> optionalInterfaceSharedLibs = {
+        {
+            "vendor.mediatek.hardware.bluetooth.audio-impl",
+            "createIBluetoothAudioProviderFactory",
+        },
         {
             "android.hardware.bluetooth.audio-impl",
             "createIBluetoothAudioProviderFactory",
@@ -136,7 +149,7 @@ int main(int /* argc */, char* /* argv */ []) {
     for (const auto& listIter : mandatoryInterfaces) {
         auto iter = listIter.begin();
         const std::string& interfaceFamilyName = *iter++;
-        LOG_ALWAYS_FATAL_IF(!registerPassthroughServiceImplementations(iter, listIter.end()),
+        LOG_ALWAYS_FATAL_IF(!registerMandatoryPassthroughServiceImplementations(iter, listIter.end()),
                             "Could not register %s", interfaceFamilyName.c_str());
     }
 
