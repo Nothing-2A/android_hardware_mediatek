@@ -14,26 +14,19 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "C2Store"
+#define LOG_TAG "C2MTKStore"
 // #define LOG_NDEBUG 0
 #include <utils/Log.h>
 
-#include <C2AllocatorBlob.h>
-#include <C2AllocatorGralloc.h>
-#include <C2AllocatorIon.h>
 #include <C2DmaBufAllocator.h>
-#include <C2BufferPriv.h>
-#include <C2BqBufferPriv.h>
 #include <C2Component.h>
 #include <C2Config.h>
-#include <C2IgbaBufferPriv.h>
 #include <C2PlatformStorePluginLoader.h>
 #include <C2PlatformSupport.h>
 #include <codec2/common/HalSelection.h>
 #include <cutils/properties.h>
 #include <util/C2InterfaceHelper.h>
-
-#include <aidl/android/hardware/media/c2/IGraphicBufferAllocator.h>
+#include <media/stagefright/foundation/MediaDefs.h>
 
 #include <dlfcn.h>
 #include <unistd.h> // getpagesize
@@ -91,6 +84,9 @@ private:
         virtual c2_status_t createInterface(
                 c2_node_id_t id, std::shared_ptr<C2ComponentInterface> *interface,
                 InterfaceDeleter deleter = std::default_delete<C2ComponentInterface>()) override;
+        virtual c2_status_t createInitInterface(
+                c2_node_id_t id, std::shared_ptr<C2ComponentInterface> *interface,
+                InterfaceDeleter deleter = std::default_delete<C2ComponentInterface>());
 
         /**
          * \returns the traits of the component in this module.
@@ -107,9 +103,11 @@ private:
         ComponentModule()
             : mInit(C2_NO_INIT),
               mLibHandle(nullptr),
+              createInitFactory(nullptr),
               createFactory(nullptr),
               destroyFactory(nullptr),
-              mComponentFactory(nullptr) {
+              mComponentFactory(nullptr),
+              mComponentInitFactory(nullptr) {
         }
 
         /**
@@ -126,9 +124,12 @@ private:
          * \retval C2_REFUSED   permission denied to load the component module (unexpected)
          * \retval C2_TIMED_OUT could not load the module within the time limit (unexpected)
          */
-        c2_status_t init(std::string libPath);
+        c2_status_t init(std::string libPath, std::string mediaType, bool isSecure, bool isLowLatency);
 
         virtual ~ComponentModule() override;
+        typedef ::C2ComponentFactory* (*CreateCodec2InitFactoryFunc)(
+            std::string, bool, bool,
+            std::function<uint32_t(bool, uint32_t, std::string, std::string)>);
 
     protected:
         std::recursive_mutex mLock; ///< lock protecting mTraits
@@ -137,9 +138,11 @@ private:
         c2_status_t mInit; ///< initialization result
 
         void *mLibHandle; ///< loaded library handle
+        CreateCodec2InitFactoryFunc createInitFactory; ///< loaded create function for init
         C2ComponentFactory::CreateCodec2FactoryFunc createFactory; ///< loaded create function
         C2ComponentFactory::DestroyCodec2FactoryFunc destroyFactory; ///< loaded destroy function
         C2ComponentFactory *mComponentFactory; ///< loaded/created component factory
+        C2ComponentFactory *mComponentInitFactory; ///< loaded/created component factory for init
     };
 
     /**
@@ -163,13 +166,13 @@ private:
          * \retval C2_CORRUPTED the component module could not be loaded
          * \retval C2_REFUSED   permission denied to load the component module
          */
-        c2_status_t fetchModule(std::shared_ptr<ComponentModule> *module) {
+        c2_status_t fetchModule(std::shared_ptr<ComponentModule> *module, bool isSecure, bool isLowLatency) {
             c2_status_t res = C2_OK;
             std::lock_guard<std::mutex> lock(mMutex);
             std::shared_ptr<ComponentModule> localModule = mModule.lock();
             if (localModule == nullptr) {
                 localModule = std::make_shared<ComponentModule>();
-                res = localModule->init(mLibPath);
+                res = localModule->init(mLibPath, mMediaType, isSecure, isLowLatency);
                 if (res == C2_OK) {
                     mModule = localModule;
                 }
@@ -184,10 +187,14 @@ private:
         ComponentLoader(std::string libPath)
             : mLibPath(libPath) {}
 
+        ComponentLoader(std::string libPath, std::string mediaType)
+            : mLibPath(libPath), mMediaType(mediaType) {}
+
     private:
         std::mutex mMutex; ///< mutex guarding the module
         std::weak_ptr<ComponentModule> mModule; ///< weak reference to the loaded module
         std::string mLibPath; ///< library path
+        std::string mMediaType;
     };
 
     struct Interface : public C2InterfaceHelper {
@@ -282,29 +289,98 @@ private:
 };
 
 c2_status_t C2MtkComponentStore::ComponentModule::init(
-        std::string libPath) {
+        std::string libPath,
+        std::string mediaType,
+        bool isSecure,
+        bool isLowLatency) {
     ALOGV("in %s", __func__);
     ALOGV("loading dll");
-
-    if(!createFactory) {
-        mLibHandle = dlopen(libPath.c_str(), RTLD_NOW|RTLD_NODELETE);
-        LOG_ALWAYS_FATAL_IF(mLibHandle == nullptr,
-                "could not dlopen %s: %s", libPath.c_str(), dlerror());
-
-        createFactory =
-            (C2ComponentFactory::CreateCodec2FactoryFunc)dlsym(mLibHandle, "CreateCodec2Factory");
-        LOG_ALWAYS_FATAL_IF(createFactory == nullptr,
-                "createFactory is null in %s", libPath.c_str());
-
-        destroyFactory =
-            (C2ComponentFactory::DestroyCodec2FactoryFunc)dlsym(mLibHandle, "DestroyCodec2Factory");
-        LOG_ALWAYS_FATAL_IF(destroyFactory == nullptr,
-                "destroyFactory is null in %s", libPath.c_str());
+    {
+        mLibHandle = dlopen(libPath.c_str(), RTLD_NOW | RTLD_NODELETE);
+    }
+    if (mLibHandle == nullptr) {
+        ALOGE("could not dlopen %s: %s", libPath.c_str(), dlerror());
+        return C2_NOT_FOUND;
     }
 
+    std::string createFactoryName = "CreateCodec2Factory";
+    std::string createInitFactoryName = "CreateCodec2InitFactory";
+    std::string destroyFactoryName = "DestroyCodec2Factory";
+
+    if (MEDIA_MIMETYPE_VIDEO_MPEG2 && MEDIA_MIMETYPE_VIDEO_MPEG2 == mediaType) {
+        createFactoryName = "CreateCodec2Mpeg2Factory";
+        destroyFactoryName = "DestroyCodec2Mpeg2Factory";
+    } else if (MEDIA_MIMETYPE_VIDEO_HEVC && MEDIA_MIMETYPE_VIDEO_HEVC == mediaType && !isSecure && !isLowLatency) {
+        createFactoryName = "CreateCodec2HevcFactory";
+        destroyFactoryName = "DestroyCodec2HevcFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_HEVC && MEDIA_MIMETYPE_VIDEO_HEVC == mediaType && isSecure) {
+        createFactoryName = "CreateCodec2HevcSecFactory";
+        destroyFactoryName = "DestroyCodec2HevcSecFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_HEVC && MEDIA_MIMETYPE_VIDEO_HEVC == mediaType && isLowLatency) {
+        createFactoryName = "CreateCodec2HevcLowLatencyFactory";
+        destroyFactoryName = "DestroyCodec2HevcLowLatencyFactory";
+    } else if (MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC && MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC == mediaType) {
+        createFactoryName = "CreateCodec2HeifFactory";
+        destroyFactoryName = "DestroyCodec2HeifFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_MPEG4 && MEDIA_MIMETYPE_VIDEO_MPEG4 == mediaType) {
+        createFactoryName = "CreateCodec2Mpeg4Factory";
+        destroyFactoryName = "DestroyCodec2Mpeg4Factory";
+    } else if (MEDIA_MIMETYPE_VIDEO_H263 && MEDIA_MIMETYPE_VIDEO_H263 == mediaType) {
+        createFactoryName = "CreateCodec2H263Factory";
+        destroyFactoryName = "DestroyCodec2H263Factory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AVC && MEDIA_MIMETYPE_VIDEO_AVC == mediaType && !isSecure && !isLowLatency) {
+        createFactoryName = "CreateCodec2AvcFactory";
+        destroyFactoryName = "DestroyCodec2AvcFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AVC && MEDIA_MIMETYPE_VIDEO_AVC == mediaType && isSecure) {
+        createFactoryName = "CreateCodec2AvcSecFactory";
+        destroyFactoryName = "DestroyCodec2AvcSecFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AVC && MEDIA_MIMETYPE_VIDEO_AVC == mediaType && isLowLatency) {
+        createFactoryName = "CreateCodec2AvcLowLatencyFactory";
+        destroyFactoryName = "DestroyCodec2AvcLowLatencyFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_VP8 && MEDIA_MIMETYPE_VIDEO_VP8 == mediaType) {
+        createFactoryName = "CreateCodec2VpxFactory";
+        destroyFactoryName = "DestroyCodec2VpxFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_VP9 && MEDIA_MIMETYPE_VIDEO_VP9 == mediaType && !isSecure && !isLowLatency) {
+        createFactoryName = "CreateCodec2Vp9Factory";
+        destroyFactoryName = "DestroyCodec2Vp9Factory";
+    } else if (MEDIA_MIMETYPE_VIDEO_VP9 && MEDIA_MIMETYPE_VIDEO_VP9 == mediaType && isSecure) {
+        createFactoryName = "CreateCodec2Vp9SecFactory";
+        destroyFactoryName = "DestroyCodec2Vp9SecFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_VP9 && MEDIA_MIMETYPE_VIDEO_VP9 == mediaType && isLowLatency) {
+        createFactoryName = "CreateCodec2Vp9LowLatencyFactory";
+        destroyFactoryName = "DestroyCodec2Vp9LowLatencyFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AV1 && MEDIA_MIMETYPE_VIDEO_AV1 == mediaType && !isSecure && !isLowLatency) {
+        createFactoryName = "CreateCodec2Av1Factory";
+        destroyFactoryName = "DestroyCodec2Av1Factory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AV1 && MEDIA_MIMETYPE_VIDEO_AV1 == mediaType && isSecure) {
+        createFactoryName = "CreateCodec2Av1SecFactory";
+        destroyFactoryName = "DestroyCodec2Av1SecFactory";
+    } else if (MEDIA_MIMETYPE_VIDEO_AV1 && MEDIA_MIMETYPE_VIDEO_AV1 == mediaType && isLowLatency) {
+        createFactoryName = "CreateCodec2Av1LowLatencyFactory";
+        destroyFactoryName = "DestroyCodec2Av1LowLatencyFactory";
+    } else if ("video/x-ms-wmv" == mediaType) {
+        createFactoryName = "CreateCodec2Vc1Factory";
+        destroyFactoryName = "DestroyCodec2Vc1Factory";
+    }
+
+    createFactory = (C2ComponentFactory::CreateCodec2FactoryFunc)dlsym(mLibHandle, createFactoryName.c_str());
+    LOG_ALWAYS_FATAL_IF(createFactory == nullptr, "createFactory is null in %s", libPath.c_str());
+
+    createInitFactory = (CreateCodec2InitFactoryFunc)dlsym(mLibHandle, createInitFactoryName.c_str());
+
+    destroyFactory = (C2ComponentFactory::DestroyCodec2FactoryFunc)dlsym(mLibHandle, destroyFactoryName.c_str());
+    LOG_ALWAYS_FATAL_IF(destroyFactory == nullptr, "destroyFactory is null in %s", libPath.c_str());
+
     mComponentFactory = createFactory();
+    if (createInitFactory != nullptr) {
+        mComponentInitFactory = createInitFactory(mediaType, isSecure, isLowLatency, 0);
+    }
+
     if (mComponentFactory == nullptr) {
         ALOGD("could not create factory in %s", libPath.c_str());
+        mInit = C2_NO_MEMORY;
+    } else if (createInitFactory != nullptr && mComponentInitFactory == nullptr) {
+        ALOGD("could not create init factory in %s", libPath.c_str());
         mInit = C2_NO_MEMORY;
     } else {
         mInit = C2_OK;
@@ -315,7 +391,7 @@ c2_status_t C2MtkComponentStore::ComponentModule::init(
     }
 
     std::shared_ptr<C2ComponentInterface> intf;
-    c2_status_t res = createInterface(0, &intf);
+    c2_status_t res = mComponentInitFactory ? createInitInterface(0, &intf) : createInterface(0, &intf);
     if (res != C2_OK) {
         ALOGD("failed to create interface: %d", res);
         return mInit;
@@ -323,9 +399,57 @@ c2_status_t C2MtkComponentStore::ComponentModule::init(
 
     std::shared_ptr<C2Component::Traits> traits(new (std::nothrow) C2Component::Traits);
     if (traits) {
-        if (!C2InterfaceUtils::FillTraitsFromInterface(traits.get(), intf)) {
-            ALOGD("Failed to fill traits from interface");
+        traits->name = intf->getName();
+
+        C2ComponentKindSetting kind;
+        C2ComponentDomainSetting domain;
+        res = intf->query_vb({ &kind, &domain }, {}, C2_MAY_BLOCK, nullptr);
+        bool fixDomain = res != C2_OK;
+        if (res == C2_OK) {
+            traits->kind = kind.value;
+            traits->domain = domain.value;
+        } else {
+            // TODO: remove this fall-back
+            ALOGD("failed to query interface for kind and domain: %d", res);
+
+            traits->kind =
+                (traits->name.find("encoder") != std::string::npos) ? C2Component::KIND_ENCODER :
+                (traits->name.find("decoder") != std::string::npos) ? C2Component::KIND_DECODER :
+                C2Component::KIND_OTHER;
+        }
+
+        uint32_t mediaTypeIndex =
+            traits->kind == C2Component::KIND_ENCODER ? C2PortMediaTypeSetting::output::PARAM_TYPE
+            : C2PortMediaTypeSetting::input::PARAM_TYPE;
+        std::vector<std::unique_ptr<C2Param>> params;
+        res = intf->query_vb({}, { mediaTypeIndex }, C2_MAY_BLOCK, &params);
+        if (res != C2_OK) {
+            ALOGD("failed to query interface: %d", res);
             return mInit;
+        }
+        if (params.size() != 1u) {
+            ALOGD("failed to query interface: unexpected vector size: %zu", params.size());
+            return mInit;
+        }
+        C2PortMediaTypeSetting *mediaTypeConfig = C2PortMediaTypeSetting::From(params[0].get());
+        if (mediaTypeConfig == nullptr) {
+            ALOGD("failed to query media type");
+            return mInit;
+        }
+	    traits->mediaType =
+            std::string(mediaTypeConfig->m.value,
+                        strnlen(mediaTypeConfig->m.value, mediaTypeConfig->flexCount()));
+
+        if (fixDomain) {
+            if (strncmp(traits->mediaType.c_str(), "audio/", 6) == 0) {
+                traits->domain = C2Component::DOMAIN_AUDIO;
+            } else if (strncmp(traits->mediaType.c_str(), "video/", 6) == 0) {
+                traits->domain = C2Component::DOMAIN_VIDEO;
+            } else if (strncmp(traits->mediaType.c_str(), "image/", 6) == 0) {
+                traits->domain = C2Component::DOMAIN_IMAGE;
+            } else {
+                traits->domain = C2Component::DOMAIN_OTHER;
+            }
         }
 
         // TODO: get this properly from the store during emplace
@@ -336,6 +460,26 @@ c2_status_t C2MtkComponentStore::ComponentModule::init(
         default:
             traits->rank = 512;
         }
+
+	    params.clear();
+        res = intf->query_vb({}, { C2ComponentAliasesSetting::PARAM_TYPE }, C2_MAY_BLOCK, &params);
+        if (res == C2_OK && params.size() == 1u) {
+            C2ComponentAliasesSetting *aliasesSetting =
+                C2ComponentAliasesSetting::From(params[0].get());
+            if (aliasesSetting) {
+                // Split aliases on ','
+                // This looks simpler in plain C and even std::string would still make a copy.
+                char *aliases = ::strndup(aliasesSetting->m.value, aliasesSetting->flexCount());
+                ALOGD("'%s' has aliases: '%s'", intf->getName().c_str(), aliases);
+
+                for (char *tok, *ptr, *str = aliases; (tok = ::strtok_r(str, ",", &ptr));
+                     str = nullptr) {
+                    traits->aliases.push_back(tok);
+                    ALOGD("adding alias: '%s'", tok);
+                }
+                free(aliases);
+            }
+        }
     }
     mTraits = traits;
 
@@ -344,8 +488,15 @@ c2_status_t C2MtkComponentStore::ComponentModule::init(
 
 C2MtkComponentStore::ComponentModule::~ComponentModule() {
     ALOGV("in %s", __func__);
-    if (destroyFactory && mComponentFactory) {
-        destroyFactory(mComponentFactory);
+    if (destroyFactory) {
+        if (mComponentInitFactory) {
+            destroyFactory(mComponentInitFactory);
+            mComponentInitFactory = nullptr;
+        }
+        if (mComponentFactory) {
+            destroyFactory(mComponentFactory);
+            mComponentFactory = nullptr;
+        }
     }
     if (mLibHandle) {
         ALOGV("unloading dll");
@@ -362,6 +513,23 @@ c2_status_t C2MtkComponentStore::ComponentModule::createInterface(
     }
     std::shared_ptr<ComponentModule> module = shared_from_this();
     c2_status_t res = mComponentFactory->createInterface(
+            id, interface, [module, deleter](C2ComponentInterface *p) mutable {
+                // capture module so that we ensure we still have it while deleting interface
+                deleter(p); // delete interface first
+                module.reset(); // remove module ref (not technically needed)
+    });
+    return res;
+}
+
+c2_status_t C2MtkComponentStore::ComponentModule::createInitInterface(
+        c2_node_id_t id, std::shared_ptr<C2ComponentInterface> *interface,
+        std::function<void(::C2ComponentInterface*)> deleter) {
+    interface->reset();
+    if (mInit != C2_OK || !mComponentInitFactory) {
+        return mComponentInitFactory ? mInit : C2_NOT_FOUND;
+    }
+    std::shared_ptr<ComponentModule> module = shared_from_this();
+    c2_status_t res = mComponentInitFactory->createInterface(
             id, interface, [module, deleter](C2ComponentInterface *p) mutable {
                 // capture module so that we ensure we still have it while deleting interface
                 deleter(p); // delete interface first
@@ -397,47 +565,40 @@ C2MtkComponentStore::C2MtkComponentStore()
       mReflector(std::make_shared<C2ReflectorHelper>()),
       mInterface(mReflector) {
 
-    auto emplace = [this](const char *libPath) {
-        mComponents.emplace(libPath, libPath);
+    auto emplace = [this](const char *key, const char *libPath, const char *mediaType) {
+        mComponents.emplace(std::piecewise_construct,
+                            std::forward_as_tuple(key),
+                            std::forward_as_tuple(libPath, mediaType));
     };
 
-    // TODO: move this also into a .so so it can be updated
-    emplace("libcodec2_soft_aacdec.so");
-    emplace("libcodec2_soft_aacenc.so");
-    emplace("libcodec2_soft_amrnbdec.so");
-    emplace("libcodec2_soft_amrnbenc.so");
-    emplace("libcodec2_soft_amrwbdec.so");
-    emplace("libcodec2_soft_amrwbenc.so");
-    //emplace("libcodec2_soft_av1dec_aom.so"); // deprecated for the gav1 implementation
-    emplace("libcodec2_soft_av1dec_gav1.so");
-    emplace("libcodec2_soft_av1dec_dav1d.so");
-    emplace("libcodec2_soft_av1enc.so");
-    emplace("libcodec2_soft_avcdec.so");
-    emplace("libcodec2_soft_avcenc.so");
-    emplace("libcodec2_soft_flacdec.so");
-    emplace("libcodec2_soft_flacenc.so");
-    emplace("libcodec2_soft_g711alawdec.so");
-    emplace("libcodec2_soft_g711mlawdec.so");
-    emplace("libcodec2_soft_gsmdec.so");
-    emplace("libcodec2_soft_h263dec.so");
-    emplace("libcodec2_soft_h263enc.so");
-    emplace("libcodec2_soft_hevcdec.so");
-    emplace("libcodec2_soft_hevcenc.so");
-    emplace("libcodec2_soft_iamfdec.so");
-    emplace("libcodec2_soft_mp3dec.so");
-    emplace("libcodec2_soft_mpeg2dec.so");
-    emplace("libcodec2_soft_mpeg4dec.so");
-    emplace("libcodec2_soft_mpeg4enc.so");
-    emplace("libcodec2_soft_opusdec.so");
-    emplace("libcodec2_soft_opusenc.so");
-    emplace("libcodec2_soft_rawdec.so");
-    emplace("libcodec2_soft_vorbisdec.so");
-    emplace("libcodec2_soft_vp8dec.so");
-    emplace("libcodec2_soft_vp8enc.so");
-    emplace("libcodec2_soft_vp9dec.so");
-    emplace("libcodec2_soft_vp9enc.so");
-    emplace("libcodec2_soft_apvenc.so");
-    emplace("libcodec2_soft_apvdec.so");
+    // MTK video decoders
+    emplace("c2.mtk.mpeg2.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_MPEG2);
+    emplace("c2.mtk.hevc.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_HEVC);
+    emplace("c2.mtk.hevc.decoder.secure", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_HEVC);
+    emplace("c2.mtk.hevc.decoder.lowlatency", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_HEVC);
+    emplace("c2.mtk.heif.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC);
+    emplace("c2.mtk.mpeg4.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_MPEG4);
+    emplace("c2.mtk.h263.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_H263);
+    emplace("c2.mtk.avc.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AVC);
+    emplace("c2.mtk.avc.decoder.secure", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AVC);
+    emplace("c2.mtk.avc.decoder.lowlatency", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AVC);
+    emplace("c2.mtk.vpx.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_VP8);
+    emplace("c2.mtk.vp9.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_VP9);
+    emplace("c2.mtk.vp9.decoder.secure", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_VP9);
+    emplace("c2.mtk.vp9.decoder.lowlatency", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_VP9);
+    emplace("c2.mtk.av1.decoder", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AV1);
+    emplace("c2.mtk.av1.decoder.secure", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AV1);
+    emplace("c2.mtk.av1.decoder.lowlatency", "libcodec2_mtk_vdec.so", MEDIA_MIMETYPE_VIDEO_AV1);
+    emplace("c2.mtk.vc1.decoder", "libcodec2_mtk_vdec.so", "video/x-ms-wmv");
+
+    // MTK video encoders
+    emplace("c2.mtk.mpeg4.encoder", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_MPEG4);
+    emplace("c2.mtk.h263.encoder", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_H263);
+    emplace("c2.mtk.avc.encoder", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_AVC);
+    emplace("c2.mtk.avc.encoder.secure", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_AVC);
+    emplace("c2.mtk.hevc.encoder", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_HEVC);
+    emplace("c2.mtk.hevc.encoder.secure", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_VIDEO_HEVC);
+    emplace("c2.mtk.heif.encoder", "libcodec2_mtk_venc.so", MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC);
 }
 
 c2_status_t C2MtkComponentStore::copyBuffer(
@@ -466,16 +627,25 @@ void C2MtkComponentStore::visitComponents() {
         return;
     }
     for (auto &pathAndLoader : mComponents) {
-        const C2String &path = pathAndLoader.first;
+        const C2String &key = pathAndLoader.first;
         ComponentLoader &loader = pathAndLoader.second;
         std::shared_ptr<ComponentModule> module;
-        if (loader.fetchModule(&module) == C2_OK) {
+        bool isSecure  = false;
+        if (key.find("secure") != std::string::npos) {
+            isSecure = true;
+        }
+        bool isLowLatency  = false;
+        if (key.find("lowlatency") != std::string::npos) {
+            isLowLatency = true;
+        }
+
+        if (loader.fetchModule(&module, isSecure, isLowLatency) == C2_OK) {
             std::shared_ptr<const C2Component::Traits> traits = module->getTraits();
             if (traits) {
                 mComponentList.push_back(traits);
-                mComponentNameToPath.emplace(traits->name, path);
+                mComponentNameToPath.emplace(traits->name, key);
                 for (const C2String &alias : traits->aliases) {
-                    mComponentNameToPath.emplace(alias, path);
+                    mComponentNameToPath.emplace(alias, key);
                 }
             }
         }
@@ -494,9 +664,18 @@ c2_status_t C2MtkComponentStore::findComponent(
     (*module).reset();
     visitComponents();
 
+    bool isSecure  = false;
+    if (name.find("secure") != std::string::npos) {
+        isSecure = true;
+    }
+    bool isLowLatency  = false;
+    if (name.find("lowlatency") != std::string::npos) {
+        isLowLatency = true;
+    }
+
     auto pos = mComponentNameToPath.find(name);
     if (pos != mComponentNameToPath.end()) {
-        return mComponents.at(pos->second).fetchModule(module);
+        return mComponents.at(pos->second).fetchModule(module, isSecure, isLowLatency);
     }
     return C2_NOT_FOUND;
 }
